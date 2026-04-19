@@ -1,0 +1,183 @@
+---
+title: "Configure multi-region failover for secret retrieval"
+description: "Set up automated failover to a secondary AWS region for high-availability secret retrieval when a primary region becomes unavailable."
+---
+
+The ASCP supports an automated failover feature that retrieves secrets from a secondary AWS region when the primary region is unavailable. This improves availability during regional connectivity outages and supports disaster recovery configurations.
+
+## How failover works
+
+When `failoverRegion` is configured, the ASCP contacts **both regions simultaneously** for every mount request and applies the following rules:
+
+- **Both succeed**: The value from the primary region is used.
+- **One returns a 5XX (server) error**: The value from the non-failing region is used.
+- **Either returns a 4XX (client) error**: The mount fails immediately. Client errors indicate a configuration problem (wrong permissions, secret not found, etc.) that must be resolved before the mount can succeed.
+
+<Note>
+  The 5XX failover rule means a transient infrastructure outage in one region will not block your pods from starting. A 4XX error in either region will always fail the mount, because it signals a configuration error rather than a temporary outage.
+</Note>
+
+## Basic configuration
+
+Define `region` and `failoverRegion` in the `parameters` section of your `SecretProviderClass`:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: my-app-secrets-failover
+spec:
+  provider: aws
+  parameters:
+    region: us-east-1
+    failoverRegion: us-east-2
+    objects: |
+      - objectName: "MySecret"
+        objectType: "secretsmanager"
+```
+
+In this configuration, both regions look up the same secret name `MySecret`. This works when the secret exists in both regions with the same name — for example, when using Secrets Manager multi-region replication.
+
+## Using different secrets per region
+
+When the primary and failover secrets have different names or ARNs (for example, independently managed secrets in each region), use the `failoverObject` field to specify the failover region's secret separately:
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: my-app-secrets-failover
+spec:
+  provider: aws
+  parameters:
+    region: us-east-1
+    failoverRegion: us-east-2
+    objects: |
+      - objectName: "arn:aws:secretsmanager:us-east-1:123456789012:secret:PrimarySecret-AbCdEf"
+        failoverObject:
+          objectName: "arn:aws:secretsmanager:us-east-2:123456789012:secret:FailoverSecret-GhIjKl"
+        objectAlias: my-secret
+```
+
+<Warning>
+  `objectAlias` is required when `failoverObject` is specified. Because the primary and failover secrets have different names, the ASCP needs an explicit alias to determine the mounted file name.
+</Warning>
+
+## Steps
+
+<Steps>
+  <Step title="Replicate or independently manage the secret in both regions">
+    Ensure the secret exists in both your primary and failover regions. You can either use Secrets Manager's built-in multi-region replication or manage two separate secrets independently.
+
+    For multi-region replication:
+
+    ```bash
+    aws secretsmanager replicate-secret-to-regions \
+      --secret-id MySecret \
+      --add-replica-regions Region=us-east-2
+    ```
+
+    For independent management, create the secret in each region separately and note both ARNs.
+  </Step>
+
+  <Step title="Grant IAM permissions for both regions">
+    Your pod's IAM role needs `secretsmanager:GetSecretValue` and `secretsmanager:DescribeSecret` for secrets in both regions:
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "secretsmanager:GetSecretValue",
+            "secretsmanager:DescribeSecret"
+          ],
+          "Resource": [
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:PrimarySecret-??????",
+            "arn:aws:secretsmanager:us-east-2:123456789012:secret:FailoverSecret-??????"
+          ]
+        }
+      ]
+    }
+    ```
+  </Step>
+
+  <Step title="Create the SecretProviderClass with failover configuration">
+    Create the `SecretProviderClass` with the `failoverRegion` parameter and, if needed, `failoverObject` entries for each secret:
+
+    ```yaml
+    apiVersion: secrets-store.csi.x-k8s.io/v1
+    kind: SecretProviderClass
+    metadata:
+      name: my-app-secrets-failover
+    spec:
+      provider: aws
+      parameters:
+        region: us-east-1
+        failoverRegion: us-east-2
+        objects: |
+          - objectName: "arn:aws:secretsmanager:us-east-1:123456789012:secret:PrimarySecret-AbCdEf"
+            failoverObject:
+              objectName: "arn:aws:secretsmanager:us-east-2:123456789012:secret:FailoverSecret-GhIjKl"
+            objectAlias: my-secret
+    ```
+
+    Apply it:
+
+    ```bash
+    kubectl apply -f secret-provider-class.yaml
+    ```
+  </Step>
+
+  <Step title="Deploy your workload">
+    Deploy your application as usual. The failover behavior is entirely transparent to the pod — it always reads from the same mounted file path regardless of which region provided the value.
+
+    ```bash
+    kubectl apply -f deployment.yaml
+    ```
+  </Step>
+</Steps>
+
+## Version matching
+
+When you pin secrets to a specific version using `objectVersion`, the primary and failover secrets must be pinned to the same version number. Mismatched version values are rejected at mount time:
+
+```yaml
+objects: |
+  - objectName: "arn:aws:secretsmanager:us-east-1:123456789012:secret:PrimarySecret-AbCdEf"
+    objectVersion: "abc123-version-id"
+    failoverObject:
+      objectName: "arn:aws:secretsmanager:us-east-2:123456789012:secret:FailoverSecret-GhIjKl"
+      objectVersion: "abc123-version-id"
+    objectAlias: my-secret
+```
+
+<Tip>
+  Avoid pinning `objectVersion` when using failover. Relying on the default (latest) version or `objectVersionLabel: AWSCURRENT` keeps both regions in sync automatically without requiring you to update the `SecretProviderClass` after each rotation.
+</Tip>
+
+## Failover with SSM Parameter Store
+
+The `failoverRegion` feature also works with SSM Parameter Store. The same rules apply: use full ARNs in `failoverObject.objectName` when the parameter names differ between regions, and `objectAlias` is required when `failoverObject` is present.
+
+```yaml
+parameters:
+  region: us-east-1
+  failoverRegion: us-east-2
+  objects: |
+    - objectName: "/my/app/db-password"
+      objectType: "ssmparameter"
+      objectAlias: "db-password"
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Automatic rotation" icon="rotate" href="/guides/rotation">
+    Combine failover with the rotation reconciler to keep secrets current across regions.
+  </Card>
+  <Card title="Cross-account access" icon="building-columns" href="/guides/cross-account">
+    Access secrets from a different AWS account using resource policies and IAM roles.
+  </Card>
+</CardGroup>

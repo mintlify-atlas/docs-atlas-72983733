@@ -1,0 +1,100 @@
+---
+title: "Build and push a private ASCP container image to ECR"
+description: "Build the AWS Secrets Store CSI Driver Provider from source and push it to your own Amazon ECR registry for air-gapped or compliance-constrained environments."
+---
+
+By default, the ASCP pulls its container image from the public ECR gallery at `public.ecr.aws/aws-secrets-manager/secrets-store-csi-driver-provider-aws`. If your cluster cannot reach the public registry — for example, in an air-gapped VPC, a private cluster, or an environment with an approved-image policy — you can build the image from source and host it in your own Amazon ECR repository.
+
+## Prerequisites
+
+- Docker with [Buildx](https://docs.docker.com/build/buildx/) enabled (required for multi-architecture builds)
+- AWS CLI configured with credentials that have ECR push permissions
+- `kubectl` and `envsubst` available on your workstation
+
+## Build and push to ECR
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/aws/secrets-store-csi-driver-provider-aws
+    cd secrets-store-csi-driver-provider-aws
+    ```
+  </Step>
+
+  <Step title="Set environment variables">
+    Export your AWS region and the full ECR repository URI. Replace `<REGION>` with your cluster's region and `<ACCOUNT>` with your 12-digit AWS account ID:
+
+    ```bash
+    export REGION=<REGION>
+    export PRIVREPO=<ACCOUNT>.dkr.ecr.$REGION.amazonaws.com/secrets-store-csi-driver-provider-aws
+    ```
+
+    The `Makefile` reads both variables. `REGION` determines which ECR endpoint to authenticate against, and `PRIVREPO` is the repository URI used for tagging and pushing the image.
+  </Step>
+
+  <Step title="Create the ECR repository (one time only)">
+    If the repository does not already exist, create it:
+
+    ```bash
+    aws --region $REGION ecr create-repository \
+      --repository-name secrets-store-csi-driver-provider-aws
+    ```
+
+    You only need to run this once per account and region.
+  </Step>
+
+  <Step title="Build and push the image">
+    Run `make` from the repository root:
+
+    ```bash
+    make
+    ```
+
+    The default `make` target runs three steps in sequence:
+
+    1. **`clean`** — Removes any previous build output from `_output/` and prunes Docker's build cache.
+    2. **`docker-login`** — Authenticates Docker with both `public.ecr.aws` (needed to pull the Amazon Linux 2 base image) and your private ECR registry.
+    3. **`docker-buildx`** — Builds a multi-architecture image (`linux/amd64` and `linux/arm64`) and pushes it to your ECR repository with the following tags:
+
+    | Tag | Description |
+    |---|---|
+    | `latest` | Floating latest tag |
+    | `3.0.1` | Full semver version |
+    | `3` | Major version |
+    | `latest-amd64` / `latest-arm64` | Architecture-specific latest tags |
+    | `latest-linux-amd64` / `latest-linux-arm64` | OS-qualified architecture tags |
+    | `3.0.1-linux-amd64` / `3.0.1-linux-arm64` | Versioned OS-qualified architecture tags |
+
+    <Note>
+      The build will fail if the versioned tag (e.g., `3.0.1`) already exists in the target repository. This prevents accidental overwrites of published images.
+    </Note>
+  </Step>
+
+  <Step title="Deploy from your private registry">
+    Apply the private installer manifest using `envsubst` to substitute the `PRIVREPO` and optional `PRIVTAG` variables into the DaemonSet spec:
+
+    ```bash
+    envsubst < deployment/private-installer.yaml | kubectl apply -f -
+    ```
+
+    The `private-installer.yaml` manifest creates the same `ServiceAccount`, `ClusterRole`, `ClusterRoleBinding`, and `DaemonSet` as the public installer, but references the image as `${PRIVREPO}${PRIVTAG:+:}${PRIVTAG}` — meaning it uses `$PRIVREPO:$PRIVTAG` when `PRIVTAG` is set, or `$PRIVREPO` (which defaults to the `latest` tag) when it is not.
+
+    To pin to a specific version:
+
+    ```bash
+    export PRIVTAG=3.0.1
+    envsubst < deployment/private-installer.yaml | kubectl apply -f -
+    ```
+  </Step>
+</Steps>
+
+## Private cluster considerations
+
+If your EKS cluster is in a private VPC with no internet egress, ensure that your VPC has the following interface VPC endpoints configured before running the build and deploy steps:
+
+- `ecr.api` — ECR API calls
+- `ecr.dkr` — ECR image pushes and pulls
+- `sts` — AWS STS for IRSA/Pod Identity token exchange
+- `secretsmanager` and/or `ssm` — The secret backends your pods will use
+
+For more information, see [Interface VPC endpoints](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_interface_vpc_endpoints.html) in the AWS IAM documentation.

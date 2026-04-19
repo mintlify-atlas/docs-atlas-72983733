@@ -1,0 +1,273 @@
+---
+title: "Mount SSM Parameter Store parameters in Kubernetes pods"
+description: "Use AWS Systems Manager Parameter Store with the ASCP to mount parameters as files in Kubernetes pods for configuration and secret management."
+---
+
+The AWS Secrets Store CSI Driver Provider (ASCP) supports AWS Systems Manager (SSM) Parameter Store in addition to Secrets Manager. Parameters are mounted as files inside your pod, making them available to applications that read configuration from disk.
+
+## Prerequisites
+
+- ASCP installed on your EKS cluster. See the [installation guide](/installation).
+- An IAM role associated with your pod's service account via [IRSA](/auth/irsa) or [EKS Pod Identity](/auth/pod-identity).
+
+## Required IAM permissions
+
+Your pod's IAM role must allow `ssm:GetParameters` on the parameters you want to mount:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameters"
+      ],
+      "Resource": [
+        "arn:aws:ssm:us-east-1:123456789012:parameter/my/app/*"
+      ]
+    }
+  ]
+}
+```
+
+<Note>
+  Unlike Secrets Manager, the ASCP uses the `GetParameters` (plural) API to batch up to 10 parameters per API call, reducing request rates and the chance of throttling.
+</Note>
+
+## Steps
+
+<Steps>
+  <Step title="Create parameters in Parameter Store">
+    Create the parameters you want to mount. Path-style names such as `/my/app/db-password` group related parameters together and make IAM policies easier to write:
+
+    ```bash
+    aws ssm put-parameter \
+      --region us-east-1 \
+      --name "/my/app/db-password" \
+      --value "supersecret" \
+      --type SecureString
+
+    aws ssm put-parameter \
+      --region us-east-1 \
+      --name "/my/app/api-key" \
+      --value "abc123" \
+      --type SecureString
+    ```
+  </Step>
+
+  <Step title="Create an IAM policy and associate it with your service account">
+    Create a policy that grants `ssm:GetParameters` access, then attach it to the service account your pod will use:
+
+    ```bash
+    POLICY_ARN=$(aws --region us-east-1 \
+      --query Policy.Arn --output text \
+      iam create-policy \
+      --policy-name my-app-ssm-policy \
+      --policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [{
+          "Effect": "Allow",
+          "Action": ["ssm:GetParameters"],
+          "Resource": [
+            "arn:aws:ssm:us-east-1:123456789012:parameter/my/app/*"
+          ]
+        }]
+      }')
+    ```
+  </Step>
+
+  <Step title="Create a SecretProviderClass">
+    Set `objectType` to `"ssmparameter"` and provide the parameter name in `objectName`. You can list multiple parameters in a single `SecretProviderClass`.
+
+    <Tabs>
+      <Tab title="IRSA">
+        ```yaml
+        apiVersion: secrets-store.csi.x-k8s.io/v1
+        kind: SecretProviderClass
+        metadata:
+          name: my-app-ssm-params
+        spec:
+          provider: aws
+          parameters:
+            objects: |
+              - objectName: "/my/app/db-password"
+                objectType: "ssmparameter"
+                objectAlias: "db-password"
+              - objectName: "/my/app/api-key"
+                objectType: "ssmparameter"
+                objectAlias: "api-key"
+        ```
+      </Tab>
+      <Tab title="EKS Pod Identity">
+        ```yaml
+        apiVersion: secrets-store.csi.x-k8s.io/v1
+        kind: SecretProviderClass
+        metadata:
+          name: my-app-ssm-params
+        spec:
+          provider: aws
+          parameters:
+            usePodIdentity: "true"
+            objects: |
+              - objectName: "/my/app/db-password"
+                objectType: "ssmparameter"
+                objectAlias: "db-password"
+              - objectName: "/my/app/api-key"
+                objectType: "ssmparameter"
+                objectAlias: "api-key"
+        ```
+      </Tab>
+    </Tabs>
+
+    Apply the manifest:
+
+    ```bash
+    kubectl apply -f secret-provider-class.yaml
+    ```
+  </Step>
+
+  <Step title="Deploy a pod that mounts the parameters">
+    Reference the `SecretProviderClass` in your deployment:
+
+    ```yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: my-app
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: my-app
+      template:
+        metadata:
+          labels:
+            app: my-app
+        spec:
+          serviceAccountName: my-app-service-account
+          volumes:
+            - name: ssm-params
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: "my-app-ssm-params"
+          containers:
+            - name: my-app
+              image: nginx
+              volumeMounts:
+                - name: ssm-params
+                  mountPath: "/mnt/secrets-store"
+                  readOnly: true
+    ```
+
+    Apply the manifest:
+
+    ```bash
+    kubectl apply -f deployment.yaml
+    ```
+  </Step>
+
+  <Step title="Verify the parameters are mounted">
+    Confirm both parameter files are present in the pod:
+
+    ```bash
+    kubectl exec -it \
+      $(kubectl get pods -l app=my-app -o jsonpath='{.items[0].metadata.name}') \
+      -- ls /mnt/secrets-store/
+    ```
+
+    Read a value:
+
+    ```bash
+    kubectl exec -it \
+      $(kubectl get pods -l app=my-app -o jsonpath='{.items[0].metadata.name}') \
+      -- cat /mnt/secrets-store/db-password
+    ```
+  </Step>
+</Steps>
+
+## Object descriptor options
+
+### Parameter name formats
+
+`objectName` accepts both plain parameter names and path-style names:
+
+```yaml
+objects: |
+  # Simple name
+  - objectName: "MyParameter"
+    objectType: "ssmparameter"
+
+  # Hierarchical path
+  - objectName: "/my/app/db-password"
+    objectType: "ssmparameter"
+```
+
+### Using objectAlias for cross-region access
+
+SSM Parameter Store does not natively support ARN-based access in `objectName` the way Secrets Manager does. Use the `objectAlias` field to give a parameter a clean file name, and set `region` explicitly in `spec.parameters` to point to the correct region:
+
+```yaml
+spec:
+  provider: aws
+  parameters:
+    region: eu-west-1
+    objects: |
+      - objectName: "/my/app/db-password"
+        objectType: "ssmparameter"
+        objectAlias: "db-password"
+```
+
+<Note>
+  Cross-account access for SSM Parameter Store is only supported for parameters in the **advanced parameter tier** via the Parameter Store shared parameters feature. Standard-tier parameters cannot be shared across accounts. See the [cross-account guide](/guides/cross-account) for details.
+</Note>
+
+### Specifying a version number
+
+Use `objectVersion` to pin the mount to a specific numeric version of the parameter:
+
+```yaml
+objects: |
+  - objectName: "/my/app/db-password"
+    objectType: "ssmparameter"
+    objectVersion: "3"
+```
+
+### Path translation for parameters with slashes
+
+Parameter names that contain `/` characters cannot be used directly as file names. By default, the ASCP substitutes `/` with `_`, so `/my/app/db-password` is mounted as the file `my_app_db-password`. Use `objectAlias` to control the file name explicitly:
+
+```yaml
+objects: |
+  - objectName: "/my/app/db-password"
+    objectType: "ssmparameter"
+    objectAlias: "db-password"
+```
+
+You can change or disable the substitution character globally using the `pathTranslation` parameter in the `SecretProviderClass`. See the [path translation reference](/configuration/path-translation) for details.
+
+## Differences from Secrets Manager
+
+| Feature | SSM Parameter Store | Secrets Manager |
+|---|---|---|
+| Version labels | Parameter Labels only | `AWSCURRENT`, `AWSPREVIOUS`, custom stages |
+| `objectVersionLabel` | Numeric version or label | Stage label string |
+| `objectVersion` + `objectVersionLabel` together | **Not allowed** | Allowed |
+| Batching | Up to 10 per API call | One per API call |
+
+<Warning>
+  SSM Parameter Store descriptors cannot specify both `objectVersion` and `objectVersionLabel` at the same time. The ASCP will reject the `SecretProviderClass` with a validation error if both fields are set for the same parameter.
+</Warning>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="JSON secret extraction" icon="brackets-curly" href="/guides/json-secrets">
+    Extract individual fields from a JSON-formatted parameter using JMESPath.
+  </Card>
+  <Card title="Cross-account access" icon="building-columns" href="/guides/cross-account">
+    Access parameters from a different AWS account using shared parameters or role chaining.
+  </Card>
+</CardGroup>

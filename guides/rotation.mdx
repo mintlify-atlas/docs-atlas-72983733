@@ -1,0 +1,120 @@
+---
+title: "Keep mounted secrets current with the rotation reconciler"
+description: "Use the CSI driver's rotation reconciler with ASCP to keep mounted secret files up to date automatically when secrets rotate in AWS."
+---
+
+When a secret rotates in AWS Secrets Manager, the mounted file in your pod is not updated by default — the ASCP only fetches secrets when a pod mounts the volume. The Secrets Store CSI Driver includes an optional alpha **rotation reconciler** that periodically remounts secrets, keeping the files on disk in sync with the current value in AWS.
+
+<Note>
+  The rotation reconciler is a feature of the **Secrets Store CSI Driver**, not the ASCP itself. You enable it when installing or upgrading the CSI driver via Helm. The ASCP responds to the driver's remount requests automatically.
+</Note>
+
+## How rotation works
+
+When the rotation reconciler is enabled:
+
+1. The CSI driver polls each mounted `SecretProviderClass` on a configurable interval.
+2. For each poll, the ASCP calls `DescribeSecret` (Secrets Manager) to check whether the current mounted version is still labeled `AWSCURRENT`.
+3. If the secret has rotated, the ASCP calls `GetSecretValue` to fetch the new version and writes it to disk.
+4. The mounted file is updated in place — applications that re-read the file will see the new value without restarting.
+
+<Warning>
+  Each poll cycle generates API calls to AWS. A short poll interval on a cluster with many pods can result in significant additional charges. A poll interval of one hour (`3600s`) is recommended as a starting point.
+</Warning>
+
+## Enabling the rotation reconciler
+
+Enable the rotation reconciler by setting `enableSecretRotation=true` when installing or upgrading the CSI driver:
+
+```bash
+helm upgrade -n kube-system csi-secrets-store \
+  secrets-store-csi-driver/secrets-store-csi-driver \
+  --set enableSecretRotation=true \
+  --set rotationPollInterval=3600s
+```
+
+If you are installing the CSI driver for the first time:
+
+```bash
+helm install -n kube-system csi-secrets-store \
+  secrets-store-csi-driver/secrets-store-csi-driver \
+  --set enableSecretRotation=true \
+  --set rotationPollInterval=3600s
+```
+
+<Tip>
+  If you installed the ASCP using its Helm chart (which includes the CSI driver as a dependency), you can pass these flags directly to the ASCP chart:
+
+  ```bash
+  helm upgrade -n kube-system secrets-provider-aws \
+    aws-secrets-manager/secrets-store-csi-driver-provider-aws \
+    --set secrets-store-csi-driver.enableSecretRotation=true \
+    --set secrets-store-csi-driver.rotationPollInterval=3600s
+  ```
+</Tip>
+
+## Choosing a poll interval
+
+The `rotationPollInterval` accepts any valid Go duration string (for example, `30m`, `1h`, `3600s`). Consider the following when choosing an interval:
+
+| Factor | Recommendation |
+|---|---|
+| AWS API costs | Longer intervals reduce `GetSecretValue` and `DescribeSecret` call counts |
+| Secret rotation schedule | Poll interval should be shorter than your rotation schedule so pods pick up new values promptly |
+| Rotation tolerance | If your application can tolerate a stale secret for up to one hour, `3600s` is a safe default |
+
+For a secret that rotates every 30 days, a one-hour poll interval means the mounted file will be at most one hour out of date after rotation, at a low API call cost.
+
+## How applications see rotated secrets
+
+The CSI driver writes the updated secret value directly to the existing file on disk. Applications that:
+
+- **Re-read the file on each use** — for example, reading the file every time a database connection is opened — will automatically pick up the new value without any restart.
+- **Cache the file contents at startup** — for example, reading the file once at process start — will continue using the old value until the process is restarted.
+
+<Tip>
+  Design applications to re-read credential files on connection failure or on a periodic basis. This allows them to recover automatically after secret rotation without a pod restart.
+</Tip>
+
+## Rotation with Secrets Manager rotation schedules
+
+AWS Secrets Manager supports [automatic rotation schedules](https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotating-secrets.html). To ensure your pods always have a current secret, set the CSI driver poll interval to a value shorter than your Secrets Manager rotation frequency.
+
+For example, if Secrets Manager rotates a secret every 24 hours, a poll interval of `3600s` (one hour) ensures the mounted file is updated within one hour of the rotation completing.
+
+## Verifying rotation is working
+
+After enabling the rotation reconciler and rotating a secret, confirm the mounted file has been updated:
+
+```bash
+# Check the current file content
+kubectl exec -it \
+  $(kubectl get pods -l app=my-app -o jsonpath='{.items[0].metadata.name}') \
+  -- cat /mnt/secrets-store/MySecret
+
+# After the poll interval elapses and the secret rotates,
+# re-run the same command to see the updated value
+kubectl exec -it \
+  $(kubectl get pods -l app=my-app -o jsonpath='{.items[0].metadata.name}') \
+  -- cat /mnt/secrets-store/MySecret
+```
+
+You can also inspect CSI driver logs for rotation activity:
+
+```bash
+kubectl -n kube-system logs \
+  $(kubectl -n kube-system get pods -l app=secrets-store-csi-driver \
+    -o jsonpath='{.items[0].metadata.name}') \
+  --container secrets-store
+```
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Mount Secrets Manager secrets" icon="lock" href="/guides/secrets-manager">
+    Full guide to configuring SecretProviderClass objects for Secrets Manager.
+  </Card>
+  <Card title="Multi-region failover" icon="arrows-rotate" href="/guides/failover-regions">
+    Keep secrets available during regional outages while rotation is active.
+  </Card>
+</CardGroup>

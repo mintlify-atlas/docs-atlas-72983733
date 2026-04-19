@@ -1,0 +1,116 @@
+---
+title: "Security considerations for the AWS secrets provider"
+description: "Security best practices, access controls, and recommendations when using ASCP to mount AWS secrets into Kubernetes pods, including IAM scoping and rotation."
+---
+
+The AWS Secrets Store CSI Driver Provider (ASCP) is designed primarily for legacy applications that expect secrets to be available as files on the local filesystem. Understanding its security trade-offs helps you deploy it safely and avoid common misconfigurations.
+
+## Prefer native AWS APIs for new applications
+
+Mounting secrets as files increases the attack surface compared to fetching secrets in-process. A process with filesystem read access to the mount point can read any secret file there.
+
+<Tip>
+  Security-conscious applications should use the [AWS SDKs](https://aws.amazon.com/developer/tools/) to fetch secrets directly from Secrets Manager or SSM Parameter Store and cache them in memory. In-memory caching avoids writing secrets to the filesystem entirely and gives you precise control over secret lifetime.
+</Tip>
+
+Reserve the ASCP for existing applications that cannot be modified to use the SDK — for example, third-party software or legacy codebases that read configuration from files.
+
+## IAM least privilege
+
+<CardGroup cols={2}>
+  <Card title="Scope to exact ARNs" icon="lock">
+    Write IAM policies that reference the full ARN of each secret rather than wildcards. Using `Resource: "*"` or a broad prefix grants access to all secrets the account contains.
+  </Card>
+  <Card title="Separate roles per workload" icon="users">
+    Create a distinct IAM role and Kubernetes service account for each deployment. Sharing a single role across multiple workloads means a compromise of one pod can expose secrets intended for another.
+  </Card>
+</CardGroup>
+
+A tightly scoped policy for a single Secrets Manager secret looks like this:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/myapp/db-password-AbCdEf"
+      ]
+    }
+  ]
+}
+```
+
+For SSM Parameter Store secrets, replace the action with `ssm:GetParameters` and adjust the resource ARN accordingly.
+
+## Restrict mounted file permissions
+
+By default, mounted secret files use `0644` permissions — readable by any user in the container. Use the `filePermission` field in your `SecretProviderClass` to tighten this:
+
+```yaml
+objects: |
+  - objectName: "prod/myapp/db-password"
+    objectType: "secretsmanager"
+    filePermission: "0600"
+```
+
+A permission of `0600` limits reads to the file owner only. Set this to the most restrictive value your application can tolerate.
+
+## Avoid storing secrets in Kubernetes objects
+
+By default, the ASCP does not sync mounted secrets into Kubernetes `Secret` objects. This means secret values are never written to etcd, which reduces the risk of exposure through the Kubernetes API.
+
+<Warning>
+  The Secrets Store CSI driver provides an optional `syncSecret` feature that copies mounted secrets into Kubernetes `Secret` objects. Enabling this feature stores secret values in etcd and makes them accessible via `kubectl get secret`. Enable it only if your application explicitly requires it, and ensure etcd encryption at rest is enabled on your cluster.
+</Warning>
+
+## Secret version pinning
+
+The `objectVersion` field in a `SecretProviderClass` entry pins the mount to a specific secret version ID. While this can be useful for testing, it prevents the ASCP from retrieving the latest version during rotation.
+
+```yaml
+# Avoid in production — blocks automatic rotation
+- objectName: "prod/myapp/api-key"
+  objectType: "secretsmanager"
+  objectVersion: "a1b2c3d4-e5f6-..."
+```
+
+Omit `objectVersion` in production workloads so that rotation is reflected automatically on the next remount or rotation reconciler cycle.
+
+## Enable the rotation reconciler
+
+The Secrets Store CSI driver's optional [rotation reconciler](https://secrets-store-csi-driver.sigs.k8s.io/topics/secret-auto-rotation.html) periodically remounts secrets so that pods pick up rotated values without restarting. Enable it with a polling interval that balances freshness against API cost:
+
+```bash
+helm upgrade -n kube-system csi-secrets-store \
+  secrets-store-csi-driver/secrets-store-csi-driver \
+  --set enableSecretRotation=true \
+  --set rotationPollInterval=3600s
+```
+
+A one-hour poll interval (`3600s`) is recommended as a sensible default. Shorter intervals increase Secrets Manager and SSM API call volume, which affects cost and may trigger throttling.
+
+<Note>
+  The rotation reconciler triggers additional AWS API calls on every poll cycle for every mounted secret across all pods. Calculate your expected call volume before choosing a poll interval: `(number of pods) × (secrets per pod) × (polls per hour)`.
+</Note>
+
+## Provider DaemonSet security context
+
+The ASCP DaemonSet runs with a non-privileged security context. The following settings are enforced by both the Helm chart and the `aws-provider-installer.yaml` manifest:
+
+```yaml
+securityContext:
+  privileged: false
+  allowPrivilegeEscalation: false
+```
+
+The provider does not require host network access (`hostNetwork: false`) and is prevented from scheduling on Fargate nodes by a node affinity rule. These defaults should not be loosened without a specific operational requirement.
+
+## Reporting security issues
+
+To report a security vulnerability in the ASCP, follow the process described in [CONTRIBUTING.md](https://github.com/aws/secrets-store-csi-driver-provider-aws/blob/main/CONTRIBUTING.md#security-issue-notifications). Do not open a public GitHub issue for security findings.

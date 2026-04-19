@@ -1,0 +1,76 @@
+---
+title: "Use FIPS 140-2 compliant endpoints for secret retrieval"
+description: "Enable FIPS 140-2 compliant AWS endpoints when using the AWS Secrets Store CSI Driver Provider in regulated environments that require FIPS compliance."
+---
+
+Federal Information Processing Standard (FIPS) 140-2 is a US government security standard for cryptographic modules. Organizations in regulated industries — such as federal agencies, defense contractors, and financial institutions — may be required to use FIPS-validated endpoints for all AWS API calls.
+
+When `useFipsEndpoint` is enabled, the ASCP routes all Secrets Manager and SSM Parameter Store API calls through FIPS-compliant endpoints rather than the standard regional endpoints. No changes to your `SecretProviderClass` or application manifests are required.
+
+## Enable FIPS endpoints
+
+<Steps>
+  <Step title="Add the FIPS flag to your Helm install command">
+    Append `--set useFipsEndpoint=true` when installing or upgrading the ASCP Helm chart.
+
+    **Install:**
+
+    ```bash
+    helm repo add aws-secrets-manager https://aws.github.io/secrets-store-csi-driver-provider-aws
+    helm install -n kube-system secrets-provider-aws \
+      aws-secrets-manager/secrets-store-csi-driver-provider-aws \
+      --set useFipsEndpoint=true
+    ```
+
+    **Upgrade an existing installation:**
+
+    ```bash
+    helm upgrade -n kube-system secrets-provider-aws \
+      aws-secrets-manager/secrets-store-csi-driver-provider-aws \
+      --set useFipsEndpoint=true
+    ```
+  </Step>
+
+  <Step title="Verify the provider pod is running">
+    Confirm that the DaemonSet rolled out successfully after the upgrade:
+
+    ```bash
+    kubectl -n kube-system get pods -l app=csi-secrets-store-provider-aws
+    ```
+
+    All pods should show `Running` status. If any pods are stuck, check the logs:
+
+    ```bash
+    kubectl -n kube-system logs pod/<PODID>
+    ```
+  </Step>
+</Steps>
+
+## values.yaml reference
+
+The `useFipsEndpoint` key is defined in the chart's `values.yaml` with a default of `false`:
+
+```yaml
+useFipsEndpoint: false
+```
+
+Set it to `true` to route all AWS API calls through FIPS endpoints. This value applies globally to the DaemonSet — you cannot enable FIPS on a per-secret or per-namespace basis.
+
+## What changes when FIPS is enabled
+
+When `useFipsEndpoint: true` is set, the provider uses the FIPS service endpoints for both supported secret backends:
+
+| Backend | Standard endpoint | FIPS endpoint |
+|---|---|---|
+| AWS Secrets Manager | `secretsmanager.<region>.amazonaws.com` | `secretsmanager-fips.<region>.amazonaws.com` |
+| AWS Systems Manager (SSM) | `ssm.<region>.amazonaws.com` | `ssm-fips.<region>.amazonaws.com` |
+
+All other provider behavior — authentication, `SecretProviderClass` evaluation, file mounting — remains identical.
+
+<Warning>
+  FIPS endpoints are not available in all AWS regions. Before enabling this flag in production, verify that FIPS endpoints exist for your target region in the [AWS FIPS endpoint documentation](https://aws.amazon.com/compliance/fips/). Attempting to connect to a FIPS endpoint in an unsupported region will cause secret mount failures.
+</Warning>
+
+<Note>
+  FIPS endpoint support applies only to Secrets Manager and SSM Parameter Store API calls made by the provider. It does not affect Kubernetes API calls made to resolve pod regions or service account role ARNs.
+</Note>

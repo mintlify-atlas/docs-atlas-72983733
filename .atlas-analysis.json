@@ -1,0 +1,82 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "AWS Secrets Store CSI Driver Provider",
+  "projectDescription": "The AWS provider for the Secrets Store CSI Driver fetches secrets from AWS Secrets Manager and SSM Parameter Store and mounts them as files in Kubernetes pods.",
+  "theme": "aspen",
+  "primaryColor": "#f41c7c",
+  "lightColor": "#1c1434",
+  "darkColor": "#fc7cbc",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Authentication",
+            "pages": [
+              "auth/irsa",
+              "auth/pod-identity"
+            ]
+          },
+          {
+            "group": "Configuration",
+            "pages": [
+              "configuration/secret-provider-class",
+              "configuration/helm-values",
+              "configuration/path-translation"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/secrets-manager",
+              "guides/parameter-store",
+              "guides/json-secrets",
+              "guides/failover-regions",
+              "guides/rotation",
+              "guides/cross-account"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/troubleshooting",
+              "operations/fips-endpoint",
+              "operations/private-builds",
+              "operations/security"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Mount AWS Secrets Manager secrets as files in Kubernetes pods",
+    "Mount AWS SSM Parameter Store parameters as files in Kubernetes pods",
+    "IAM Roles for Service Accounts (IRSA) authentication",
+    "EKS Pod Identity authentication",
+    "Automated failover across AWS regions for high availability",
+    "JMESPath support for extracting individual keys from JSON secrets",
+    "FIPS endpoint support for compliance requirements",
+    "Secret rotation reconciliation support",
+    "Cross-account secret access",
+    "Helm chart deployment with configurable values"
+  ],
+  "publicApiSurface": [
+    "SecretProviderClass (CRD): spec.provider=aws, spec.parameters.objects",
+    "SecretDescriptor: objectName, objectType, objectAlias, objectVersion, objectVersionLabel, filePermission, jmesPath, failoverObject",
+    "JMESPathEntry: path, objectAlias, filePermission",
+    "FailoverObjectEntry: objectName, objectVersion, objectVersionLabel",
+    "Helm values: image, awsRegion, driverWritesSecrets, useFipsEndpoint, podIdentityHttpTimeout, resources, affinity, tolerations",
+    "CLI flags: --provider-volume, --driver-writes-secrets, --qps, --burst, --eks-addon-version, --pod-identity-http-timeout",
+    "SecretProviderClass parameters: objects, region, failoverRegion, pathTranslation, usePodIdentity, preferredAddressType"
+  ]
+}

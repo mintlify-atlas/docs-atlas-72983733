@@ -1,0 +1,204 @@
+---
+title: "Access secrets across AWS accounts with EKS Pod Identity"
+description: "Mount secrets from a different AWS account than your EKS cluster using cross-account IAM resource policies, KMS key policies, and Pod Identity roles."
+---
+
+By default, the ASCP accesses secrets in the same AWS account as the EKS cluster. If your secrets are stored in a separate account — for example, a centralized secrets management account — you need to configure cross-account access.
+
+## Constraints
+
+EKS Pod Identity associations require the IAM role to reside in the **same account** as the EKS cluster. You cannot create a Pod Identity association that directly assumes a role in another account.
+
+To access secrets in a different account, you instead configure a **resource-based policy** on the secret (and optionally on its KMS key) in the target account, granting the Pod Identity role in the cluster account permission to access it.
+
+<Note>
+  If you are using IRSA rather than Pod Identity, cross-account access can also be achieved via role chaining — the pod's IRSA role assumes a role in the target account. See the AWS documentation for [cross-account role access with IRSA](https://docs.aws.amazon.com/eks/latest/userguide/cross-account-access.html).
+</Note>
+
+## Supported services
+
+<AccordionGroup>
+  <Accordion title="AWS Secrets Manager">
+    Cross-account access is fully supported for Secrets Manager secrets at any tier. You configure a resource-based policy on the secret and, if the secret is encrypted with a customer-managed KMS key, a key policy on that key.
+  </Accordion>
+  <Accordion title="SSM Parameter Store">
+    Cross-account access for SSM Parameter Store is **only supported for parameters in the advanced parameter tier** using the Parameter Store shared parameters feature. Standard-tier parameters cannot be accessed cross-account. See [Working with Shared Parameters](https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-shared-parameters.html) for details.
+  </Accordion>
+</AccordionGroup>
+
+## Architecture overview
+
+```
+Cluster account (111111111111)          Secrets account (222222222222)
+─────────────────────────────           ─────────────────────────────
+Pod                                     Secret: MySecret
+  └── Service account                     └── Resource policy:
+        └── Pod Identity role                   Allow 111111111111
+              (pod-identity-role)                     GetSecretValue
+                                                      DescribeSecret
+                                          KMS Key (if CMK):
+                                            └── Key policy:
+                                                  Allow 111111111111
+                                                        kms:Decrypt
+                                                        kms:GenerateDataKey
+```
+
+## Steps
+
+<Steps>
+  <Step title="Identify the IAM role used by your Pod Identity association">
+    Find the ARN of the IAM role attached to your pod's service account via Pod Identity. This role lives in the cluster account:
+
+    ```bash
+    eksctl get podidentityassociation \
+      --cluster my-cluster \
+      --namespace default
+    ```
+
+    Note the role ARN — you will reference it in the resource policy in the next step. For this example, assume the role ARN is:
+
+    ```
+    arn:aws:iam::111111111111:role/my-pod-identity-role
+    ```
+  </Step>
+
+  <Step title="Add a resource policy to the secret in the target account">
+    In the account that owns the secret (`222222222222`), add a resource-based policy that grants the cluster account's Pod Identity role permission to read the secret:
+
+    ```bash
+    aws secretsmanager put-resource-policy \
+      --region us-east-1 \
+      --secret-id MySecret \
+      --resource-policy '{
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::111111111111:role/my-pod-identity-role"
+            },
+            "Action": [
+              "secretsmanager:GetSecretValue",
+              "secretsmanager:DescribeSecret"
+            ],
+            "Resource": "*"
+          }
+        ]
+      }'
+    ```
+
+    The `Resource: "*"` in a resource policy refers to the secret itself — it is not a wildcard across all secrets.
+  </Step>
+
+  <Step title="Configure the KMS key policy (if the secret uses a customer-managed key)">
+    If the secret is encrypted with a customer-managed KMS key (not the AWS-managed default key), add a statement to the key policy in the target account granting the Pod Identity role permission to decrypt:
+
+    ```bash
+    # First, get the current key policy
+    aws kms get-key-policy \
+      --region us-east-1 \
+      --key-id arn:aws:kms:us-east-1:222222222222:key/mrk-example12345 \
+      --policy-name default
+
+    # Then update the policy to add the cross-account statement
+    aws kms put-key-policy \
+      --region us-east-1 \
+      --key-id arn:aws:kms:us-east-1:222222222222:key/mrk-example12345 \
+      --policy-name default \
+      --policy '{
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "arn:aws:iam::111111111111:role/my-pod-identity-role"
+            },
+            "Action": [
+              "kms:Decrypt",
+              "kms:GenerateDataKey"
+            ],
+            "Resource": "*"
+          }
+        ]
+      }'
+    ```
+
+    <Warning>
+      This example shows only the cross-account statement. In practice, merge this statement with the existing key policy rather than replacing it — replacing the policy without the key administrator statement can lock you out of the key.
+    </Warning>
+  </Step>
+
+  <Step title="Verify the Pod Identity role has no conflicting deny policies">
+    The Pod Identity role in the cluster account (`111111111111`) does not need an explicit `Allow` for the cross-account secret — the resource policy on the secret grants access. However, make sure there are no explicit `Deny` statements on the role or its permission boundary that block `secretsmanager:GetSecretValue`.
+
+    ```bash
+    aws iam simulate-principal-policy \
+      --policy-source-arn arn:aws:iam::111111111111:role/my-pod-identity-role \
+      --action-names secretsmanager:GetSecretValue \
+      --resource-arns arn:aws:secretsmanager:us-east-1:222222222222:secret:MySecret-AbCdEf
+    ```
+  </Step>
+
+  <Step title="Create the SecretProviderClass using the full cross-account ARN">
+    Reference the secret by its full ARN so the ASCP knows which account and region to target:
+
+    ```yaml
+    apiVersion: secrets-store.csi.x-k8s.io/v1
+    kind: SecretProviderClass
+    metadata:
+      name: cross-account-secret
+    spec:
+      provider: aws
+      parameters:
+        usePodIdentity: "true"
+        region: us-east-1
+        objects: |
+          - objectName: "arn:aws:secretsmanager:us-east-1:222222222222:secret:MySecret-AbCdEf"
+            objectAlias: "my-secret"
+    ```
+
+    Apply the manifest:
+
+    ```bash
+    kubectl apply -f secret-provider-class.yaml
+    ```
+  </Step>
+
+  <Step title="Deploy the workload and verify">
+    Deploy your pod and confirm the secret is mounted:
+
+    ```bash
+    kubectl apply -f deployment.yaml
+
+    kubectl exec -it \
+      $(kubectl get pods -l app=my-app -o jsonpath='{.items[0].metadata.name}') \
+      -- cat /mnt/secrets-store/my-secret
+    ```
+  </Step>
+</Steps>
+
+## Cross-account access with IRSA
+
+If you are using IRSA instead of Pod Identity, cross-account access can be achieved in two ways:
+
+1. **Resource policy approach** (same as above): Add a resource policy on the secret in the target account granting the IRSA role permission to call `GetSecretValue` and `DescribeSecret`. No role chaining is required.
+
+2. **Role chaining**: The IRSA role in the cluster account assumes a role in the target account. This requires configuring a trust relationship on the target account's role and calling `sts:AssumeRole` in the pod.
+
+The resource policy approach is simpler and is recommended when the IRSA role is already scoped to the necessary principals.
+
+## Further reading
+
+- [Cross-account access examples for Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_examples_cross.html) in the AWS documentation
+- [Working with shared parameters](https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-shared-parameters.html) for SSM Parameter Store cross-account access
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="EKS Pod Identity" icon="key" href="/auth/pod-identity">
+    Learn how Pod Identity associations and IAM roles work for same-account access.
+  </Card>
+  <Card title="Multi-region failover" icon="arrows-rotate" href="/guides/failover-regions">
+    Combine cross-account access with multi-region failover for high availability.
+  </Card>
+</CardGroup>

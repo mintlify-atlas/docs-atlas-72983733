@@ -1,80 +1,148 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quickstart: mount your first AWS secret in Kubernetes"
+description: "Create an AWS secret, configure IAM permissions with IRSA, define a SecretProviderClass, and mount the secret into an nginx pod on EKS."
 ---
 
-## Get started in three steps
+This guide walks you through mounting an AWS Secrets Manager secret into a Kubernetes pod using IAM Roles for Service Accounts (IRSA). By the end, you will have a running nginx deployment with a secret available as a file at `/mnt/secrets-store/MySecret`.
 
-Get your documentation site running locally and make your first customization.
+Before you begin, make sure the ASCP is installed on your cluster. See [Install the AWS Secrets Store CSI Driver Provider](/installation) if you have not done so.
 
-### Step 1: Set up your local environment
+<Steps>
+  <Step title="Set your region and cluster name">
+    Export your AWS region and EKS cluster name as shell variables. These are used in subsequent commands.
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash
+    REGION=<REGION>
+    CLUSTERNAME=<CLUSTERNAME>
+    ```
 
-### Step 2: Deploy your changes
+    Replace `<REGION>` with the AWS region your cluster runs in (for example, `us-east-1`) and `<CLUSTERNAME>` with the name of your EKS cluster.
+  </Step>
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+  <Step title="Create a test secret">
+    Create a secret in AWS Secrets Manager with a username and password:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```bash
+    aws --region "$REGION" secretsmanager create-secret \
+      --name MySecret \
+      --secret-string '{"username":"memeuser", "password":"hunter2"}'
+    ```
+  </Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+  <Step title="Create an IAM policy scoped to the secret">
+    Create an IAM policy that grants read access to `MySecret` only, and save its ARN to a variable:
 
-### Step 3: Go live
+    ```bash
+    POLICY_ARN=$(aws --region "$REGION" --query Policy.Arn --output text iam create-policy \
+      --policy-name nginx-deployment-policy \
+      --policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [ {
+          "Effect": "Allow",
+          "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+          "Resource": ["arn:*:secretsmanager:*:*:secret:MySecret-??????"]
+        } ]
+      }')
+    ```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    <Note>
+      If you are accessing SSM Parameter Store parameters, also include `"ssm:GetParameters"` in the `Action` list. You can tighten the `Resource` further by using the full secret ARN returned by `create-secret`.
+    </Note>
+  </Step>
+
+  <Step title="Create the OIDC provider and IAM service account">
+    First, associate an IAM OIDC provider with your cluster if you have not already done so:
+
+    ```bash
+    eksctl utils associate-iam-oidc-provider \
+      --region="$REGION" \
+      --cluster="$CLUSTERNAME" \
+      --approve
+    ```
+
+    Then create the Kubernetes service account and attach the IAM policy to it using IRSA:
+
+    ```bash
+    eksctl create iamserviceaccount \
+      --name nginx-irsa-deployment-sa \
+      --region="$REGION" \
+      --cluster "$CLUSTERNAME" \
+      --attach-policy-arn "$POLICY_ARN" \
+      --approve \
+      --override-existing-serviceaccounts
+    ```
+
+    <Note>
+      For private clusters, ensure the VPC has an AWS STS interface endpoint. See [Interface VPC endpoints](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_interface_vpc_endpoints.html) in the IAM User Guide for details.
+    </Note>
+  </Step>
+
+  <Step title="Apply the SecretProviderClass">
+    The `SecretProviderClass` tells the ASCP which secrets to fetch and mount. Apply the example that mounts `MySecret`:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/examples/ExampleSecretProviderClass-IRSA.yaml
+    ```
+
+    This creates the following resource in your cluster:
+
+    ```yaml
+    apiVersion: secrets-store.csi.x-k8s.io/v1
+    kind: SecretProviderClass
+    metadata:
+      name: nginx-irsa-deployment-aws-secrets
+    spec:
+      provider: aws
+      parameters:
+        objects: |
+            - objectName: "MySecret"
+              objectType: "secretsmanager"
+    ```
+  </Step>
+
+  <Step title="Deploy the example nginx pod">
+    Deploy the sample nginx application. It uses the service account created in the previous step and mounts the secret volume at `/mnt/secrets-store`:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/examples/ExampleDeployment-IRSA.yaml
+    ```
+
+    Wait for the pods to reach `Running` status:
+
+    ```bash
+    kubectl get pods -l app=nginx-irsa
+    ```
+  </Step>
+
+  <Step title="Verify the secret is mounted">
+    Once the pod is running, read the mounted secret file to confirm the secret was fetched and mounted correctly:
+
+    ```bash
+    kubectl exec -it $(kubectl get pods | awk '/nginx-irsa-deployment/{print $1}' | head -1) \
+      -- cat /mnt/secrets-store/MySecret; echo
+    ```
+
+    You should see the secret value printed to your terminal:
+
+    ```json
+    {"username":"memeuser", "password":"hunter2"}
+    ```
+  </Step>
+</Steps>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="IRSA authentication" icon="shield" href="/auth/irsa">
+    Learn more about configuring IAM Roles for Service Accounts in depth.
+  </Card>
+  <Card title="EKS Pod Identity" icon="key" href="/auth/pod-identity">
+    Use the newer EKS Pod Identity feature instead of IRSA.
+  </Card>
+  <Card title="SecretProviderClass reference" icon="gear" href="/configuration/secret-provider-class">
+    Explore all parameters for defining which secrets to mount.
+  </Card>
+  <Card title="JSON secret extraction" icon="brackets-curly" href="/guides/json-secrets">
+    Mount individual keys from a JSON-formatted secret using JMESPath.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

@@ -1,0 +1,170 @@
+---
+title: "Troubleshoot AWS Secrets Store CSI Driver mount issues"
+description: "Diagnose and fix common mount failures, authentication errors, and configuration issues with the AWS Secrets Store CSI Driver Provider (ASCP)."
+---
+
+When a pod fails to start or secrets are not mounted correctly, the most effective approach is to inspect the pod events first, then check the provider logs for detailed error messages. Most failures surface as mount errors on the pod and can be traced back to IAM permissions, incorrect `SecretProviderClass` configuration, or CSI driver setup.
+
+## Inspect the failing pod
+
+Retrieve pod names in your namespace (add `-n <NAMESPACE>` if not using the default namespace):
+
+```bash
+kubectl get pods
+```
+
+Describe the pod to see mount error events:
+
+```bash
+kubectl describe pod/<PODID>
+```
+
+The `Events` section at the bottom of the output usually contains the first error message reported by the CSI driver.
+
+## Check provider logs
+
+The ASCP provider pod runs in the `kube-system` namespace. List pods there to find its ID:
+
+```bash
+kubectl -n kube-system get pods
+```
+
+Then stream its logs (replace `<PODID>` with the name of the `csi-secrets-store-provider-aws` pod):
+
+```bash
+kubectl -n kube-system logs pod/<PODID>
+```
+
+The provider logs contain the full error returned by the AWS API, which makes it easier to distinguish IAM errors from configuration errors.
+
+## Common issues
+
+<AccordionGroup>
+  <Accordion title="Permission denied / AccessDenied">
+    The IAM policy attached to the pod's service account does not grant access to the requested secret.
+
+    **Fix:** Verify that the policy ARN attached via IRSA or Pod Identity includes the exact secret ARN. For Secrets Manager, the required actions are `secretsmanager:GetSecretValue` and `secretsmanager:DescribeSecret`. For SSM Parameter Store, the required action is `ssm:GetParameters`.
+
+    ```json
+    {
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": ["arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-??????"]
+    }
+    ```
+
+    Confirm that the region and account ID in the policy ARN match the secret's actual ARN.
+  </Accordion>
+
+  <Accordion title="Secret not found">
+    The `objectName` in the `SecretProviderClass` does not match any secret in the target region.
+
+    **Fix:** Verify the secret name or ARN using the AWS CLI:
+
+    ```bash
+    aws secretsmanager describe-secret --secret-id MySecret --region us-east-1
+    ```
+
+    Also check that the `region` field in the `SecretProviderClass` matches the region where the secret was created. If `region` is omitted, the provider falls back to the `topology.kubernetes.io/region` label on the node.
+  </Accordion>
+
+  <Accordion title="Invalid ARN format">
+    The `objectName` contains an ARN that cannot be parsed.
+
+    **Fix:** Validate the ARN structure. A valid Secrets Manager ARN follows this pattern:
+
+    ```
+    arn:aws:secretsmanager:<region>:<account-id>:secret:<secret-name>
+    ```
+
+    Common mistakes include missing segments, extra colons, or incorrect partition values (e.g., `arn:aws-cn` for China regions).
+  </Accordion>
+
+  <Accordion title="objectType mismatch">
+    The `objectType` field is set but does not match the service indicated by the ARN.
+
+    **Fix:** Ensure that `objectType` agrees with the ARN service segment. Use `secretsmanager` for Secrets Manager ARNs and `ssmparameter` for SSM Parameter Store ARNs. When using a full ARN for `objectName`, `objectType` is optional — omitting it avoids this class of error entirely.
+  </Accordion>
+
+  <Accordion title="Path traversal error">
+    The `objectName` or `objectAlias` contains `../`, which is rejected to prevent path traversal.
+
+    **Fix:** Remove any `../` sequences from the `objectName` or `objectAlias`. If a secret name contains path separators (forward slash), use the `pathTranslation` field to substitute them with a safe character (the default substitution is `_`).
+  </Accordion>
+
+  <Accordion title="Invalid file permission">
+    The `filePermission` value is not a valid 4-digit octal string.
+
+    **Fix:** The `filePermission` field must be exactly four octal digits (characters `0`–`7`). Examples of valid values: `0644`, `0600`, `0400`. Values like `644`, `0777`, or `0889` are rejected.
+
+    ```yaml
+    objects: |
+      - objectName: "MySecret"
+        objectType: "secretsmanager"
+        filePermission: "0640"
+    ```
+  </Accordion>
+
+  <Accordion title="Duplicate object alias">
+    Two objects in the same `SecretProviderClass` resolve to the same file name.
+
+    **Fix:** Each entry in the `objects` list must produce a unique file name at the mount point. Either assign distinct `objectAlias` values to each entry, or give them different `objectName` values. This error also occurs when two `jmesPath` entries share the same `objectAlias`.
+  </Accordion>
+
+  <Accordion title="tokenRequests not configured">
+    The CSI driver is missing the required `tokenRequests` audiences, causing the ASCP provider to fail when parsing service account tokens.
+
+    **Fix:** Configure the CSI driver with both required audiences. If using Helm:
+
+    ```bash
+    helm upgrade csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver \
+      --set tokenRequests[0].audience="sts.amazonaws.com" \
+      --set tokenRequests[1].audience="pods.eks.amazonaws.com"
+    ```
+
+    If using kubectl, add the following to your `CSIDriver` manifest:
+
+    ```yaml
+    spec:
+      tokenRequests:
+        - audience: "sts.amazonaws.com"
+        - audience: "pods.eks.amazonaws.com"
+    ```
+
+    <Note>
+      When you install the ASCP via its Helm chart, the CSI driver is installed as a dependency with these audiences already configured. This step is only required when installing the CSI driver separately.
+    </Note>
+  </Accordion>
+
+  <Accordion title="Client-side rate limiting to the Kubernetes API server">
+    The provider makes Kubernetes API calls to resolve the pod's region and the IAM role ARN on every mount. Under high pod churn, it can hit the default client-side QPS limit (5 QPS, burst 10).
+
+    **Fix:** Increase the `qps` and `burst` flags using the Helm `k8sThrottlingParams` value:
+
+    ```bash
+    helm upgrade -n kube-system secrets-provider-aws \
+      aws-secrets-manager/secrets-store-csi-driver-provider-aws \
+      --set-json 'k8sThrottlingParams={"qps": "20", "burst": "40"}'
+    ```
+  </Accordion>
+
+  <Accordion title="Fargate node error">
+    The ASCP runs as a DaemonSet and cannot be scheduled on Fargate nodes.
+
+    **Fix:** Fargate node groups are not supported. The Helm chart and the `aws-provider-installer.yaml` manifest both include a node affinity rule that prevents scheduling on nodes with the `eks.amazonaws.com/compute-type: fargate` label. If you need secret mounting for Fargate workloads, consider using the native AWS SDKs inside your container image instead.
+  </Accordion>
+</AccordionGroup>
+
+## Working with non-default namespaces
+
+When your application pods run in a namespace other than `default`, append the `-n` flag to all `kubectl` commands:
+
+```bash
+kubectl get pods -n <NAMESPACE>
+kubectl describe pod/<PODID> -n <NAMESPACE>
+```
+
+The provider itself always runs in `kube-system`, so provider log commands always use `-n kube-system` regardless of where your application pods are deployed.

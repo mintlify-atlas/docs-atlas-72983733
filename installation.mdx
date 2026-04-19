@@ -1,0 +1,104 @@
+---
+title: "Install AWS Secrets Store CSI Driver Provider on EKS"
+description: "Install the AWS Secrets Store CSI Driver Provider on EKS using Helm or kubectl, including prerequisites and CSI driver tokenRequests configuration."
+---
+
+The AWS Secrets Store CSI Driver Provider (ASCP) runs as a DaemonSet on your EKS cluster and acts as a plugin for the Secrets Store CSI Driver. Once installed, it allows you to mount secrets from AWS Secrets Manager and parameters from AWS Systems Manager Parameter Store directly into your pods as files.
+
+## Prerequisites
+
+Before installing the ASCP, make sure your environment meets the following requirements:
+
+- **Amazon EKS 1.17 or later** running an EC2 node group. If you plan to use EKS Pod Identity, EKS 1.24 or later is required.
+- **IAM access configured** — either [IAM Roles for Service Accounts (IRSA)](/auth/irsa) or [EKS Pod Identity](/auth/pod-identity).
+
+<Warning>
+  Fargate node groups are not supported. The ASCP runs as a DaemonSet, and AWS EKS does not support DaemonSets on Fargate nodes.
+</Warning>
+
+## Install the ASCP
+
+<Tabs>
+  <Tab title="Helm (recommended)">
+    The Helm chart for the ASCP automatically installs a compatible version of the Secrets Store CSI Driver as a dependency. This is the recommended approach because it handles both components together and configures the required `tokenRequests` audiences automatically.
+
+    <Steps>
+      <Step title="Add the Helm repository">
+        ```bash
+        helm repo add aws-secrets-manager https://aws.github.io/secrets-store-csi-driver-provider-aws
+        ```
+      </Step>
+      <Step title="Install the chart">
+        ```bash
+        helm install -n kube-system secrets-provider-aws aws-secrets-manager/secrets-store-csi-driver-provider-aws
+        ```
+
+        This installs both the ASCP and the Secrets Store CSI Driver in the `kube-system` namespace.
+
+        <Note>
+          To skip installing the bundled CSI driver (for example, if you already have it installed separately), add `--set secrets-store-csi-driver.install=false` to the command above.
+        </Note>
+      </Step>
+    </Steps>
+  </Tab>
+  <Tab title="kubectl">
+    If you prefer to install without Helm, you can apply the provider installer manifest directly. Note that this method does **not** install the Secrets Store CSI Driver — you must install it separately first (see below).
+
+    <Steps>
+      <Step title="Install the Secrets Store CSI Driver">
+        ```bash
+        helm repo add secrets-store-csi-driver https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
+        helm install -n kube-system csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver
+        ```
+
+        <Note>
+          Older versions of the driver may require `--set grpcSupportedProviders="aws"` on the install command.
+        </Note>
+      </Step>
+      <Step title="Apply the ASCP installer manifest">
+        ```bash
+        kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/deployment/aws-provider-installer.yaml
+        ```
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+## Configure tokenRequests for the CSI driver
+
+If you installed the Secrets Store CSI Driver separately (not via the ASCP Helm chart), you must configure `tokenRequests` on the driver so that the ASCP can authenticate with AWS services. The ASCP Helm chart sets these automatically.
+
+<Tabs>
+  <Tab title="Helm upgrade">
+    ```bash
+    helm upgrade csi-secrets-store secrets-store-csi-driver/secrets-store-csi-driver \
+      --set tokenRequests[0].audience="sts.amazonaws.com" \
+      --set tokenRequests[1].audience="pods.eks.amazonaws.com"
+    ```
+  </Tab>
+  <Tab title="kubectl patch">
+    Add the following `tokenRequests` block to your `CSIDriver` manifest and apply it:
+
+    ```yaml
+    apiVersion: storage.k8s.io/v1
+    kind: CSIDriver
+    metadata:
+      name: secrets-store.csi.k8s.io
+    spec:
+      tokenRequests:
+        - audience: "sts.amazonaws.com"
+        - audience: "pods.eks.amazonaws.com"
+    ```
+  </Tab>
+</Tabs>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Create a test secret and mount it into a pod end-to-end.
+  </Card>
+  <Card title="IRSA authentication" icon="shield" href="/auth/irsa">
+    Set up IAM Roles for Service Accounts to grant pods access to secrets.
+  </Card>
+</CardGroup>

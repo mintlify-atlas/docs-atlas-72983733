@@ -1,0 +1,290 @@
+---
+title: "Helm chart values reference for the AWS secrets provider"
+description: "Reference for all configurable Helm values and CLI flags when deploying the AWS Secrets Store CSI Driver Provider to an EKS cluster."
+---
+
+The AWS Secrets Store CSI Driver Provider ships as a Helm chart that deploys the provider DaemonSet and, by default, installs a compatible version of the upstream Secrets Store CSI Driver as a dependency. Every value below can be set with `--set` on `helm install` or `helm upgrade`, or collected in a custom `values.yaml` file.
+
+<CodeGroup>
+
+```bash Install with defaults
+helm repo add aws-secrets-manager https://aws.github.io/secrets-store-csi-driver-provider-aws
+helm install -n kube-system secrets-provider-aws \
+  aws-secrets-manager/secrets-store-csi-driver-provider-aws
+```
+
+```bash Install with overrides
+helm install -n kube-system secrets-provider-aws \
+  aws-secrets-manager/secrets-store-csi-driver-provider-aws \
+  --set useFipsEndpoint=true \
+  --set driverWritesSecrets=true \
+  --set podIdentityHttpTimeout=500ms
+```
+
+```bash Install without the bundled CSI driver
+helm install -n kube-system secrets-provider-aws \
+  aws-secrets-manager/secrets-store-csi-driver-provider-aws \
+  --set secrets-store-csi-driver.install=false
+```
+
+</CodeGroup>
+
+---
+
+## Image
+
+<ParamField path="image.repository" type="string" default="public.ecr.aws/aws-secrets-manager/secrets-store-csi-driver-provider-aws">
+  Container image repository for the provider. Override this when pulling from a private registry, for example when using a VPC-internal ECR mirror or a custom build.
+</ParamField>
+
+<ParamField path="image.tag" type="string" default="3.0.1">
+  Image tag to deploy. Pinning a specific tag is recommended for production environments to ensure reproducible rollouts.
+</ParamField>
+
+<ParamField path="image.pullPolicy" type="string" default="IfNotPresent">
+  Kubernetes image pull policy. Accepts `Always`, `IfNotPresent`, or `Never`.
+</ParamField>
+
+<ParamField path="imagePullSecrets" type="array" default="[]">
+  List of Kubernetes secret names to use when pulling the image from a private registry.
+</ParamField>
+
+---
+
+## AWS configuration
+
+<ParamField path="awsRegion" type="string" default="">
+  Sets the `AWS_REGION` environment variable on the provider DaemonSet pods. When set, the provider uses this region instead of resolving the region from the node's `topology.kubernetes.io/region` label. Providing the region here eliminates the extra Kubernetes API call made on each mount.
+
+  ```bash
+  helm install ... --set awsRegion=us-west-2
+  ```
+</ParamField>
+
+<ParamField path="useFipsEndpoint" type="boolean" default="false">
+  Forces the provider to use FIPS 140-2 compliant endpoints for all AWS API calls to Secrets Manager and SSM Parameter Store. Enable this for workloads running in environments that require FIPS-compliant cryptography.
+
+  ```bash
+  helm install ... --set useFipsEndpoint=true
+  ```
+</ParamField>
+
+<ParamField path="podIdentityHttpTimeout" type="string" default="">
+  Configures the HTTP request timeout for calls to the EKS Pod Identity Agent endpoint. Accepts any valid Go duration string such as `"250ms"`, `"2s"`, or `"1m"`. When left empty, the AWS SDK default is used. Values above 30 seconds are accepted but will produce a warning in the provider logs.
+
+  ```bash
+  helm install ... --set podIdentityHttpTimeout=500ms
+  ```
+</ParamField>
+
+---
+
+## Secret writing mode
+
+<ParamField path="driverWritesSecrets" type="boolean" default="false">
+  When `false` (the default), the AWS provider writes secret content directly to the pod's mount directory as regular files using an atomic rename strategy.
+
+  When `true`, the provider returns secret data to the Secrets Store CSI Driver, which then writes the files using Kubernetes' [atomic writer](https://github.com/kubernetes/kubernetes/blob/master/pkg/volume/util/atomic_writer.go). Atomic writer relies on symlinks to update file content during secret rotation. Applications that inspect file metadata such as modification timestamps must follow symlinks (e.g. use `stat -L` instead of `stat`) to see current values.
+
+  ```bash
+  helm install ... --set driverWritesSecrets=true
+  ```
+</ParamField>
+
+---
+
+## Resource management
+
+<ParamField path="resources.requests.cpu" type="string" default="50m">
+  CPU request for each provider pod.
+</ParamField>
+
+<ParamField path="resources.requests.memory" type="string" default="100Mi">
+  Memory request for each provider pod.
+</ParamField>
+
+<ParamField path="resources.limits.cpu" type="string" default="50m">
+  CPU limit for each provider pod.
+</ParamField>
+
+<ParamField path="resources.limits.memory" type="string" default="100Mi">
+  Memory limit for each provider pod.
+</ParamField>
+
+---
+
+## Scheduling
+
+<ParamField path="affinity" type="object">
+  Node affinity rules for the provider DaemonSet. The default configuration excludes Fargate nodes, because DaemonSets are not supported on Fargate.
+
+  ```yaml
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: "eks.amazonaws.com/compute-type"
+                operator: NotIn
+                values:
+                  - fargate
+  ```
+
+  Override this field to restrict provider pods to specific node groups or instance types.
+</ParamField>
+
+<ParamField path="tolerations" type="array" default="[]">
+  Tolerations applied to the provider DaemonSet pods. Add tolerations to schedule the provider on tainted nodes such as dedicated node groups.
+
+  ```yaml
+  tolerations:
+    - key: "dedicated"
+      operator: "Equal"
+      value: "gpu"
+      effect: "NoSchedule"
+  ```
+</ParamField>
+
+<ParamField path="nodeSelector" type="object" default="{}">
+  Label selector constraints used to restrict which nodes the provider DaemonSet is scheduled on.
+
+  ```yaml
+  nodeSelector:
+    kubernetes.io/os: linux
+```
+</ParamField>
+
+<ParamField path="priorityClassName" type="string" default="">
+  Assigns a [PriorityClass](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/) to the provider pods. Set to `system-node-critical` to ensure the provider is not evicted under resource pressure.
+</ParamField>
+
+---
+
+## Networking and ports
+
+<ParamField path="port" type="number" default="8989">
+  The port on which the provider's gRPC server listens. This matches the socket file path used by the Secrets Store CSI Driver to communicate with the provider.
+</ParamField>
+
+<ParamField path="providerVolume" type="string" default="/var/run/secrets-store-csi-providers">
+  Host path used as the rendezvous directory for the provider Unix domain socket (`aws.sock`). The Secrets Store CSI Driver must be configured to look for providers in this same directory.
+</ParamField>
+
+<ParamField path="kubeletPath" type="string" default="/var/lib/kubelet">
+  Path to the kubelet root directory on the host. The CSI driver uses this path to locate the staging and target directories for volume mounts.
+</ParamField>
+
+---
+
+## DaemonSet rollout
+
+<ParamField path="updateStrategy" type="object" default='{"type": "RollingUpdate"}'>
+  The update strategy for the provider DaemonSet. Accepts `RollingUpdate` or `OnDelete`.
+
+  ```yaml
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  ```
+</ParamField>
+
+---
+
+## RBAC
+
+<ParamField path="rbac.install" type="boolean" default="true">
+  When `true`, the chart creates the `ClusterRole`, `ClusterRoleBinding`, and `ServiceAccount` resources required for the provider to call Kubernetes APIs (used to look up the pod's region label and service account annotations). Set to `false` only if you manage RBAC resources outside Helm.
+</ParamField>
+
+---
+
+## Security context
+
+<ParamField path="securityContext.privileged" type="boolean" default="false">
+  Runs the provider container in privileged mode. Not required for normal operation; the provider does not need elevated kernel privileges to read secrets from AWS or write files to the mount directory.
+</ParamField>
+
+<ParamField path="securityContext.allowPrivilegeEscalation" type="boolean" default="false">
+  Controls whether the provider container process can gain more privileges than its parent process. Defaults to `false` to follow the principle of least privilege.
+</ParamField>
+
+---
+
+## Kubernetes API rate limiting
+
+The provider calls the Kubernetes API server on every mount request to resolve the pod's region and, when using IRSA, to look up the IAM role ARN from the service account annotation. On clusters with high pod churn, the default client-side rate limits may be reached.
+
+<ParamField path="k8sThrottlingParams.qps" type="number" default="5">
+  Maximum queries per second the provider is allowed to send to the Kubernetes API server. Increase this value if the provider logs show client-side throttling errors.
+
+  ```bash
+  helm install ... --set-json 'k8sThrottlingParams={"qps": "20", "burst": "40"}'
+  ```
+</ParamField>
+
+<ParamField path="k8sThrottlingParams.burst" type="number" default="10">
+  Maximum burst size above the QPS limit for Kubernetes API calls. This controls how many requests can be issued in a single burst before the client-side rate limiter kicks in.
+</ParamField>
+
+---
+
+## Bundled CSI driver dependency
+
+By default the chart installs a compatible release of the upstream Secrets Store CSI Driver as a Helm dependency. All settings under `secrets-store-csi-driver.*` are passed through to that sub-chart.
+
+<ParamField path="secrets-store-csi-driver.install" type="boolean" default="true">
+  Set to `false` to skip installing the bundled CSI driver. Use this when you manage the Secrets Store CSI Driver separately or need to pin it to a specific version.
+
+  ```bash
+  helm install ... --set secrets-store-csi-driver.install=false
+  ```
+</ParamField>
+
+<Note>
+  When `secrets-store-csi-driver.install=true`, the chart automatically configures `tokenRequests` with `sts.amazonaws.com` and `pods.eks.amazonaws.com` audiences in the CSIDriver spec. If you install the CSI driver separately, you must add these token audiences manually. See the [installation guide](https://github.com/aws/secrets-store-csi-driver-provider-aws#separate-csi-driver-installation) for the required manifest change.
+</Note>
+
+---
+
+## Provider CLI flags
+
+The following flags are passed to the provider binary at startup. When using Helm they map directly to the values documented above. Use them if you build and deploy the provider outside of the Helm chart.
+
+<AccordionGroup>
+  <Accordion title="--provider-volume">
+    **Default**: `/var/run/secrets-store-csi-providers`
+
+    The directory where the provider creates its Unix domain socket (`aws.sock`). The Secrets Store CSI Driver must be configured to look in this same directory for the AWS provider socket.
+  </Accordion>
+
+  <Accordion title="--driver-writes-secrets">
+    **Default**: `false`
+
+    When set to `true`, the provider returns secret bytes to the CSI driver rather than writing files itself. Corresponds to the `driverWritesSecrets` Helm value.
+  </Accordion>
+
+  <Accordion title="--qps">
+    **Default**: `5`
+
+    Maximum queries per second to the Kubernetes API server. Corresponds to `k8sThrottlingParams.qps`.
+  </Accordion>
+
+  <Accordion title="--burst">
+    **Default**: `10`
+
+    Maximum burst for Kubernetes API server throttling. Corresponds to `k8sThrottlingParams.burst`.
+  </Accordion>
+
+  <Accordion title="--eks-addon-version">
+    **Default**: *(empty)*
+
+    Overrides the version string reported in the `User-Agent` header for AWS API calls. Set automatically when the provider is deployed as an EKS managed add-on.
+  </Accordion>
+
+  <Accordion title="--pod-identity-http-timeout">
+    **Default**: *(AWS SDK default)*
+
+    The HTTP timeout for requests to the Pod Identity Agent. Accepts Go duration strings (`250ms`, `2s`). Values must be positive and are capped with a warning at 30 seconds. Corresponds to the `podIdentityHttpTimeout` Helm value.
+  </Accordion>
+</AccordionGroup>

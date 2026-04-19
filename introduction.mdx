@@ -1,0 +1,65 @@
+---
+title: "AWS Secrets Store CSI Driver Provider: what it does"
+description: "Mount AWS Secrets Manager secrets and SSM Parameter Store parameters directly into Kubernetes pods as files using the Secrets Store CSI Driver."
+---
+
+The AWS Secrets Store CSI Driver Provider (ASCP) integrates AWS secret storage services with Kubernetes, letting you securely mount secrets from AWS Secrets Manager and AWS Systems Manager Parameter Store into your pods as files — without writing secrets into Kubernetes objects or your container images.
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install the ASCP on your EKS cluster using Helm or kubectl in minutes.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Create your first SecretProviderClass and mount a secret into a pod.
+  </Card>
+  <Card title="IRSA Authentication" icon="shield" href="/auth/irsa">
+    Use IAM Roles for Service Accounts to grant pods access to secrets.
+  </Card>
+  <Card title="EKS Pod Identity" icon="key" href="/auth/pod-identity">
+    Authenticate using the newer EKS Pod Identity feature.
+  </Card>
+</CardGroup>
+
+## What is the AWS Secrets Store CSI Driver Provider?
+
+Many applications expect secrets to be available as files on disk. The ASCP bridges AWS secret storage services and Kubernetes by acting as a provider plugin for the [Secrets Store CSI Driver](https://secrets-store-csi-driver.sigs.k8s.io/). When a pod is scheduled, the driver calls this provider, which fetches your secrets from AWS and presents them as mounted files inside the pod.
+
+Key benefits:
+- **No secrets in Kubernetes**: Secrets never get stored in etcd or Kubernetes `Secret` objects (unless you configure syncing).
+- **Fine-grained IAM access**: Each pod uses its own IAM role, scoped to only the secrets it needs.
+- **Automatic rotation support**: Works with the CSI driver's rotation reconciler to keep mounted secrets up to date.
+- **Multi-region failover**: Configure a secondary AWS region to maintain availability during outages.
+
+## Supported AWS services
+
+<CardGroup cols={2}>
+  <Card title="AWS Secrets Manager" icon="lock" href="/guides/secrets-manager">
+    Store and retrieve database credentials, API keys, certificates, and other secrets with automatic rotation support.
+  </Card>
+  <Card title="SSM Parameter Store" icon="list" href="/guides/parameter-store">
+    Store configuration data and secrets in a hierarchical structure with optional encryption.
+  </Card>
+</CardGroup>
+
+## Explore the documentation
+
+<CardGroup cols={3}>
+  <Card title="Configuration reference" icon="gear" href="/configuration/secret-provider-class">
+    All SecretProviderClass parameters and object descriptor fields explained.
+  </Card>
+  <Card title="JSON secret extraction" icon="brackets-curly" href="/guides/json-secrets">
+    Use JMESPath to extract individual keys from JSON-formatted secrets.
+  </Card>
+  <Card title="Failover regions" icon="arrows-rotate" href="/guides/failover-regions">
+    Configure automated failover to a secondary AWS region.
+  </Card>
+  <Card title="Helm values" icon="sliders" href="/configuration/helm-values">
+    Full reference for all Helm chart configuration options.
+  </Card>
+  <Card title="Troubleshooting" icon="bug" href="/operations/troubleshooting">
+    Diagnose common mount failures and authentication errors.
+  </Card>
+  <Card title="Security" icon="shield-halved" href="/operations/security">
+    Security considerations and best practices for using the ASCP.
+  </Card>
+</CardGroup>

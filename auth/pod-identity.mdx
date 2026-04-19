@@ -1,0 +1,247 @@
+---
+title: "Authenticate Kubernetes pods using EKS Pod Identity"
+description: "Configure EKS Pod Identity as an alternative to IRSA for granting Kubernetes pods scoped IAM permissions to access AWS secrets without OIDC federation."
+---
+
+EKS Pod Identity is an alternative authentication mechanism for the AWS Secrets Store CSI Driver Provider (ASCP) that does not rely on an OIDC identity provider. Instead, it uses the Amazon EKS Pod Identity Agent, a DaemonSet that runs on each node and vends short-lived AWS credentials directly to pods via a local endpoint. Pod Identity simplifies IAM role management because trust relationships are configured at the EKS cluster level rather than per-role.
+
+<Warning>
+  EKS Pod Identity requires EKS 1.24 or later and is only supported for **EKS in the cloud on EC2 node groups**. It is not available on:
+
+  - Amazon EKS Anywhere
+  - Red Hat OpenShift Service on AWS (ROSA)
+  - Self-managed Kubernetes clusters on Amazon EC2
+
+  If you are running any of these environments, use [IRSA](/auth/irsa) instead.
+</Warning>
+
+## Prerequisites
+
+- An EKS cluster running EKS 1.24 or later with EC2 node groups
+- The [Secrets Store CSI driver](https://secrets-store-csi-driver.sigs.k8s.io/getting-started/installation.html) and ASCP installed in your cluster
+- `eksctl`, `kubectl`, and the AWS CLI installed and configured
+
+## Setup
+
+Set your region and cluster name as shell variables to use throughout the steps below:
+
+```bash
+REGION=<REGION>
+CLUSTERNAME=<CLUSTERNAME>
+```
+
+<Steps>
+  <Step title="Install the Amazon EKS Pod Identity Agent add-on">
+    The Pod Identity Agent is a DaemonSet that runs on every node and serves credentials to pods through a local link-local endpoint. Install it as a managed EKS add-on:
+
+    ```bash
+    eksctl create addon \
+      --name eks-pod-identity-agent \
+      --cluster "$CLUSTERNAME" \
+      --region "$REGION"
+    ```
+
+    This deploys the agent to the `kube-system` namespace. The ASCP provider communicates with it at `http://169.254.170.23/v1/credentials` (IPv4) or `http://[fd00:ec2::23]/v1/credentials` (IPv6).
+  </Step>
+
+  <Step title="Create a test secret">
+    Create a secret in AWS Secrets Manager to use for validation:
+
+    ```bash
+    aws --region "$REGION" secretsmanager create-secret \
+      --name MySecret \
+      --secret-string '{"username":"memeuser", "password":"hunter2"}'
+    ```
+  </Step>
+
+  <Step title="Create an IAM policy scoped to the secret">
+    Create an access policy that grants the pod permission to read only the specific secret. Save the resulting policy ARN in a shell variable:
+
+    ```bash
+    POLICY_ARN=$(aws --region "$REGION" \
+      --query Policy.Arn \
+      --output text \
+      iam create-policy \
+      --policy-name nginx-deployment-policy \
+      --policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [ {
+          "Effect": "Allow",
+          "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+          "Resource": ["arn:*:secretsmanager:*:*:secret:MySecret-??????"]
+        } ]
+      }')
+    ```
+
+    <Note>
+      When accessing SSM Parameter Store parameters, use `"ssm:GetParameters"` instead. For production workloads, replace the wildcard resource with the full secret ARN from the `create-secret` output.
+    </Note>
+  </Step>
+
+  <Step title="Create an IAM role with the EKS Pod Identity trust policy">
+    Create an IAM role that can be assumed by the EKS service principal for Pod Identity. The trust policy must allow both `sts:AssumeRole` and `sts:TagSession` for `pods.eks.amazonaws.com`:
+
+    ```bash
+    ROLE_ARN=$(aws --region "$REGION" \
+      --query Role.Arn \
+      --output text \
+      iam create-role \
+      --role-name nginx-deployment-role \
+      --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "pods.eks.amazonaws.com"
+            },
+            "Action": [
+              "sts:AssumeRole",
+              "sts:TagSession"
+            ]
+          }
+        ]
+      }')
+    ```
+
+    Then attach the IAM policy created in the previous step:
+
+    ```bash
+    aws iam attach-role-policy \
+      --role-name nginx-deployment-role \
+      --policy-arn $POLICY_ARN
+    ```
+  </Step>
+
+  <Step title="Create the pod identity association">
+    Associate the IAM role with a Kubernetes service account in your cluster. This replaces the OIDC annotation approach used by IRSA:
+
+    ```bash
+    eksctl create podidentityassociation \
+      --cluster "$CLUSTERNAME" \
+      --namespace default \
+      --region "$REGION" \
+      --service-account-name nginx-pod-identity-deployment-sa \
+      --role-arn $ROLE_ARN \
+      --create-service-account true
+    ```
+
+    The `--create-service-account true` flag creates the Kubernetes service account automatically. The association is stored in EKS and looked up by the Pod Identity Agent at runtime — no annotation on the service account is required.
+
+    <Note>
+      Pod Identity associations require the IAM role to reside in the same AWS account as the EKS cluster. To access secrets in a different account, configure a resource-based policy on the secret and a KMS key policy. See [cross-account access](https://docs.aws.amazon.com/secretsmanager/latest/userguide/auth-and-access_examples_cross.html) in the Secrets Manager documentation.
+    </Note>
+  </Step>
+
+  <Step title="Create a SecretProviderClass with usePodIdentity enabled">
+    Apply a `SecretProviderClass` that instructs ASCP to use Pod Identity by setting `usePodIdentity: "true"`:
+
+    ```yaml
+    apiVersion: secrets-store.csi.x-k8s.io/v1
+    kind: SecretProviderClass
+    metadata:
+      name: nginx-pod-identity-deployment-aws-secrets
+    spec:
+      provider: aws
+      parameters:
+        objects: |
+          - objectName: "MySecret"
+            objectType: "secretsmanager"
+        usePodIdentity: "true"
+    ```
+
+    Save this file and apply it, or apply the example directly from the repository:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/examples/ExampleSecretProviderClass-PodIdentity.yaml
+    ```
+  </Step>
+
+  <Step title="Deploy the pod referencing the service account">
+    Deploy a pod that mounts the secret. The pod's `serviceAccountName` must match the service account from the pod identity association:
+
+    ```yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: nginx-pod-identity-deployment
+      labels:
+        app: nginx-pod-identity
+    spec:
+      replicas: 2
+      selector:
+        matchLabels:
+          app: nginx-pod-identity
+      template:
+        metadata:
+          labels:
+            app: nginx-pod-identity
+        spec:
+          serviceAccountName: nginx-pod-identity-deployment-sa
+          volumes:
+            - name: secrets-store-inline
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: "nginx-pod-identity-deployment-aws-secrets"
+          containers:
+            - name: nginx-pod-identity-deployment
+              image: nginx
+              ports:
+                - containerPort: 80
+              volumeMounts:
+                - name: secrets-store-inline
+                  mountPath: "/mnt/secrets-store"
+                  readOnly: true
+    ```
+
+    Or apply the example from the repository:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/examples/ExampleDeployment-PodIdentity.yaml
+    ```
+  </Step>
+</Steps>
+
+## Verify the mount
+
+Once the pod is running, confirm the secret is mounted correctly:
+
+```bash
+kubectl exec -it $(kubectl get pods | awk '/nginx-pod-identity-deployment/{print $1}' | head -1) \
+  -- cat /mnt/secrets-store/MySecret; echo
+```
+
+## SecretProviderClass parameters
+
+### usePodIdentity
+
+The `usePodIdentity` parameter in `SecretProviderClass` selects the authentication method. When absent, ASCP defaults to IRSA.
+
+| Value | Effect |
+|---|---|
+| `"true"`, `"True"`, `"TRUE"`, `"t"`, `"T"` | Use EKS Pod Identity |
+| `"false"`, `"False"`, `"FALSE"`, `"f"`, `"F"` | Use IRSA (explicit override) |
+| _(not set)_ | Use IRSA (default) |
+
+### preferredAddressType
+
+The `preferredAddressType` parameter controls which Pod Identity Agent endpoint ASCP connects to. This field is only evaluated when `usePodIdentity` is enabled and is ignored for IRSA.
+
+| Value | Behavior |
+|---|---|
+| `"ipv4"`, `"IPv4"`, `"IPV4"` | Force use of the IPv4 endpoint (`169.254.170.23`) |
+| `"ipv6"`, `"IPv6"`, `"IPV6"` | Force use of the IPv6 endpoint (`fd00:ec2::23`) |
+| _(not set)_ | Auto: try IPv4 first, fall back to IPv6 |
+
+Example using explicit IPv4:
+
+```yaml
+parameters:
+  usePodIdentity: "true"
+  preferredAddressType: "ipv4"
+  objects: |
+    - objectName: "MySecret"
+      objectType: "secretsmanager"
+```

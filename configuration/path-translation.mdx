@@ -1,0 +1,161 @@
+---
+title: "Configure path translation for mounted secret file names"
+description: "How pathTranslation replaces path separator characters in AWS secret names so they can be safely mounted as files inside a Kubernetes pod."
+---
+
+AWS Systems Manager Parameter Store names are hierarchical by design. A parameter like `/my-app/database/password` uses forward slashes to organize configuration data into namespaces. When the AWS Secrets Store CSI Driver Provider mounts a parameter as a file inside a pod, it uses the parameter name as the file name — but a forward slash is a directory separator on Linux, so using the name directly would attempt to create nested directories rather than a single file.
+
+The `pathTranslation` field in `spec.parameters` controls how the provider handles this situation.
+
+---
+
+## Default behavior
+
+When `pathTranslation` is not set (or is set to any single character), the provider replaces every occurrence of the path separator `/` in the secret name with the specified character before writing the file. The default substitution character is the underscore `_`.
+
+```yaml
+parameters:
+  objects: |
+    - objectName: "/my-app/database/password"
+      objectType: "ssmparameter"
+```
+
+With the default settings, this parameter is mounted at:
+
+```
+/mnt/secrets-store/my-app_database_password
+```
+
+<Note>
+  Leading slashes are stripped automatically when translation is enabled. `/my-app/database/password` becomes `my-app_database_password`, not `_my-app_database_password`.
+</Note>
+
+---
+
+## Setting a custom substitution character
+
+To use a different single character instead of `_`, set `pathTranslation` to that character.
+
+```yaml
+parameters:
+  pathTranslation: "-"
+  objects: |
+    - objectName: "/my-app/database/password"
+      objectType: "ssmparameter"
+```
+
+With the above configuration, the parameter is mounted as:
+
+```
+/mnt/secrets-store/my-app-database-password
+```
+
+`pathTranslation` must be exactly one character. Any value that is not `"False"` and is longer than one character causes the mount request to fail with an error.
+
+---
+
+## Disabling substitution
+
+Set `pathTranslation` to the string `"False"` to turn off character substitution entirely.
+
+```yaml
+parameters:
+  pathTranslation: "False"
+  objects: |
+    - objectName: "/my-app/database/password"
+      objectType: "ssmparameter"
+      objectAlias: "db-password"
+```
+
+<Warning>
+  When translation is disabled, a secret name that contains `/` cannot be used as a file name without an `objectAlias`. If `objectAlias` is not provided and the secret name contains slashes, the provider will attempt to interpret the name as a file path, which will fail unless the intermediate directories already exist in the mount directory.
+</Warning>
+
+When `pathTranslation: "False"` is set, always provide an `objectAlias` for any object whose name contains a path separator.
+
+---
+
+## Using `objectAlias` as an alternative
+
+Regardless of the `pathTranslation` setting, you can always use `objectAlias` to assign an explicit, safe file name to any mounted secret. This is the most predictable approach when you need full control over the mounted file names.
+
+```yaml
+parameters:
+  pathTranslation: "False"
+  objects: |
+    - objectName: "/my-app/database/password"
+      objectType: "ssmparameter"
+      objectAlias: "db-password"
+
+    - objectName: "/my-app/api/key"
+      objectType: "ssmparameter"
+      objectAlias: "api-key"
+```
+
+Both parameters are mounted with clean, application-friendly names:
+
+```
+/mnt/secrets-store/db-password
+/mnt/secrets-store/api-key
+```
+
+`objectAlias` also overrides path translation, so you can enable translation globally but still use explicit aliases for specific entries.
+
+---
+
+## Behavior comparison
+
+| `pathTranslation` value | Secret name | Mounted file name |
+|---|---|---|
+| *(omitted, default)* | `/my-app/db/pass` | `my-app_db_pass` |
+| `"_"` (explicit) | `/my-app/db/pass` | `my-app_db_pass` |
+| `"-"` | `/my-app/db/pass` | `my-app-db-pass` |
+| `"."` | `/my-app/db/pass` | `my-app.db.pass` |
+| `"False"` + no alias | `/my-app/db/pass` | *(mount failure)* |
+| `"False"` + `objectAlias: "pass"` | `/my-app/db/pass` | `pass` |
+
+---
+
+## Path traversal protection
+
+Regardless of the `pathTranslation` setting, the provider always rejects file names that contain the `../` sequence. This check applies to both the translated `objectName` and any `objectAlias` value. Attempts to use path traversal in secret names or aliases fail at mount time with a validation error.
+
+The pattern checked in `provider/secret_descriptor.go` is:
+
+```
+(\/\.\.\/)|(^\.\.\/)|(\/\.\.$)
+```
+
+This prevents a malicious or misconfigured `SecretProviderClass` from writing files outside the designated mount directory.
+
+---
+
+## Example: mixing translated and aliased objects
+
+```yaml
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: app-parameters
+  namespace: default
+spec:
+  provider: aws
+  parameters:
+    region: us-east-1
+    pathTranslation: "_"
+
+    objects: |
+      # Translation applies: mounted as "my-app_config_feature-flags"
+      - objectName: "/my-app/config/feature-flags"
+        objectType: "ssmparameter"
+
+      # Alias overrides translation: mounted as "db-password"
+      - objectName: "/my-app/database/password"
+        objectType: "ssmparameter"
+        objectAlias: "db-password"
+
+      # Secrets Manager name without slashes: mounted as-is
+      - objectName: "MyAppApiKey"
+        objectType: "secretsmanager"
+        filePermission: "0400"
+```

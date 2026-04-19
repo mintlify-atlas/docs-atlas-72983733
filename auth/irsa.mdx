@@ -1,0 +1,174 @@
+---
+title: "Authenticate pods with IAM Roles for Service Accounts"
+description: "Use IRSA to grant Kubernetes pods scoped IAM permissions for accessing AWS Secrets Manager and Parameter Store secrets without long-lived credentials."
+---
+
+IAM Roles for Service Accounts (IRSA) is the default authentication mechanism used by the AWS Secrets Store CSI Driver Provider (ASCP). It works by associating an IAM role with a Kubernetes service account through your cluster's OpenID Connect (OIDC) identity provider, so pods can retrieve short-lived AWS credentials scoped to exactly the secrets they need — without managing static credentials or instance profiles.
+
+## Prerequisites
+
+- An EKS cluster running EKS 1.17 or later with EC2 node groups (Fargate is not supported)
+- The [Secrets Store CSI driver](https://secrets-store-csi-driver.sigs.k8s.io/getting-started/installation.html) and ASCP installed in your cluster
+- `eksctl`, `kubectl`, and the AWS CLI installed and configured
+
+## Setup
+
+Set your region and cluster name as shell variables to use throughout the steps below:
+
+```bash
+REGION=<REGION>
+CLUSTERNAME=<CLUSTERNAME>
+```
+
+<Steps>
+  <Step title="Associate the OIDC provider with your cluster">
+    IRSA requires your EKS cluster to have an IAM OIDC provider. If you have not already done this, run the following command once per cluster:
+
+    ```bash
+    eksctl utils associate-iam-oidc-provider \
+      --region="$REGION" \
+      --cluster="$CLUSTERNAME" \
+      --approve
+    ```
+
+    This creates the OIDC identity provider in IAM that lets EKS issue tokens that AWS STS can validate.
+
+    <Note>
+      If your cluster is in a private VPC, ensure the VPC has an AWS STS interface endpoint configured. Without it, IRSA token exchange calls to `sts.amazonaws.com` will fail. See [Interface VPC endpoints](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_interface_vpc_endpoints.html) in the IAM User Guide for details.
+    </Note>
+  </Step>
+
+  <Step title="Create a test secret">
+    Create a secret in AWS Secrets Manager to use for validation:
+
+    ```bash
+    aws --region "$REGION" secretsmanager create-secret \
+      --name MySecret \
+      --secret-string '{"username":"memeuser", "password":"hunter2"}'
+    ```
+  </Step>
+
+  <Step title="Create an IAM policy scoped to the secret">
+    Create an access policy that grants the pod permission to read only the specific secret. Save the resulting policy ARN in a shell variable:
+
+    ```bash
+    POLICY_ARN=$(aws --region "$REGION" \
+      --query Policy.Arn \
+      --output text \
+      iam create-policy \
+      --policy-name nginx-deployment-policy \
+      --policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [ {
+          "Effect": "Allow",
+          "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+          "Resource": ["arn:*:secretsmanager:*:*:secret:MySecret-??????"]
+        } ]
+      }')
+    ```
+
+    <Note>
+      When accessing SSM Parameter Store parameters, replace the action list with `"ssm:GetParameters"` and update the resource ARN accordingly. The wildcard match above is used for brevity; for production workloads, use the full secret ARN returned by `create-secret`.
+    </Note>
+  </Step>
+
+  <Step title="Create the service account with the IAM role attached">
+    Create a Kubernetes service account and bind the IAM policy to it using `eksctl`. This command creates both the service account in your cluster and the IAM role with the OIDC trust relationship:
+
+    ```bash
+    eksctl create iamserviceaccount \
+      --name nginx-irsa-deployment-sa \
+      --region="$REGION" \
+      --cluster "$CLUSTERNAME" \
+      --attach-policy-arn "$POLICY_ARN" \
+      --approve \
+      --override-existing-serviceaccounts
+    ```
+
+    The resulting service account is annotated with `eks.amazonaws.com/role-arn`, which ASCP reads at mount time to assume the role via the OIDC token issued by the CSI driver.
+  </Step>
+
+  <Step title="Create a SecretProviderClass">
+    Apply a `SecretProviderClass` that tells ASCP which secret to mount. Because `usePodIdentity` is not set, IRSA is used by default:
+
+    ```yaml
+    apiVersion: secrets-store.csi.x-k8s.io/v1
+    kind: SecretProviderClass
+    metadata:
+      name: nginx-irsa-deployment-aws-secrets
+    spec:
+      provider: aws
+      parameters:
+        objects: |
+          - objectName: "MySecret"
+            objectType: "secretsmanager"
+    ```
+
+    Save this file and apply it, or apply the example directly from the repository:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/examples/ExampleSecretProviderClass-IRSA.yaml
+    ```
+  </Step>
+
+  <Step title="Deploy the pod referencing the service account">
+    Deploy a pod that mounts the secret. The pod's `serviceAccountName` must match the service account created in step 4:
+
+    ```yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: nginx-irsa-deployment
+      labels:
+        app: nginx-irsa
+    spec:
+      replicas: 2
+      selector:
+        matchLabels:
+          app: nginx-irsa
+      template:
+        metadata:
+          labels:
+            app: nginx-irsa
+        spec:
+          serviceAccountName: nginx-irsa-deployment-sa
+          volumes:
+          - name: secrets-store-inline
+            csi:
+              driver: secrets-store.csi.k8s.io
+              readOnly: true
+              volumeAttributes:
+                secretProviderClass: "nginx-irsa-deployment-aws-secrets"
+          containers:
+          - name: nginx-irsa-deployment
+            image: nginx
+            ports:
+            - containerPort: 80
+            volumeMounts:
+            - name: secrets-store-inline
+              mountPath: "/mnt/secrets-store"
+              readOnly: true
+    ```
+
+    Or apply the example from the repository:
+
+    ```bash
+    kubectl apply -f https://raw.githubusercontent.com/aws/secrets-store-csi-driver-provider-aws/main/examples/ExampleDeployment-IRSA.yaml
+    ```
+  </Step>
+</Steps>
+
+## Verify the mount
+
+Once the pod is running, confirm the secret is mounted correctly:
+
+```bash
+kubectl exec -it $(kubectl get pods | awk '/nginx-irsa-deployment/{print $1}' | head -1) \
+  -- cat /mnt/secrets-store/MySecret; echo
+```
+
+## How IRSA works in ASCP
+
+When a pod is scheduled, the CSI driver issues a projected service account token with the `sts.amazonaws.com` audience and passes it to the ASCP provider. ASCP reads the `eks.amazonaws.com/role-arn` annotation on the service account, then calls `sts:AssumeRoleWithWebIdentity` to exchange the token for short-lived AWS credentials scoped to that role. These credentials are used for all subsequent Secrets Manager or Parameter Store API calls during the mount.
+
+The `usePodIdentity` parameter in `SecretProviderClass` controls which auth method is used. When the field is absent or set to `"false"`, `"False"`, `"FALSE"`, `"f"`, or `"F"`, ASCP uses IRSA. To switch to EKS Pod Identity instead, see [Authenticate with EKS Pod Identity](/auth/pod-identity).
